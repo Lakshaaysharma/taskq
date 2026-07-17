@@ -1,0 +1,7 @@
+-std=c++17
+-Wall
+-Wextra
+-I.
+-I/opt/homebrew/opt/hiredis/include
+-I/opt/homebrew/opt/nlohmann-json/include
+-I/opt/homebrew/opt/catch2/include

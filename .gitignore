@@ -1,0 +1,23 @@
+# C++ build artifacts
+example
+tests
+*.o
+*.out
+*.dSYM/
+
+# Python CLI
+cli/.venv/
+__pycache__/
+*.pyc
+
+# Web dashboard
+web/node_modules/
+web/.next/
+web/out/
+web/next-env.d.ts
+web/*.tsbuildinfo
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
