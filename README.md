@@ -54,13 +54,35 @@ exhausted it is buried in the dead-letter list.
 
 ## Features
 - **At-least-once delivery** with per-task retry budgets.
-- **Exponential backoff** on failure (`base * 2^retry`).
+- **Exactly-once side effects** via idempotency keys — a duplicate or redelivered
+  task whose key already completed is a no-op that returns the original result.
+- **Exponential backoff with jitter** on failure (delay uniform in `[d/2, d]`,
+  `d = base * 2^retry`) to avoid a thundering herd of simultaneous retries.
 - **Scheduled tasks** — run at a wall-clock time or after a delay.
 - **Weighted priorities** — higher-weight queues are polled more often.
-- **Pause / resume** individual queues without stopping workers.
 - **Crash recovery** — leased tasks whose worker dies are automatically requeued.
 - **Dead-letter queue** for tasks that exhaust their retries.
+- **Pause / resume** individual queues without stopping workers.
+- **Connection reuse** — one long-lived Redis connection per worker thread, with
+  an event-driven prefetch window for high throughput.
 - **No heavyweight deps** — hiredis + pthread; UUIDs and the thread pool are built in.
+
+## Benchmarks
+Measured by [`bench.cpp`](bench.cpp) on a local Redis (Apple Silicon, 8 workers).
+Numbers are machine-dependent; run it yourself with `./bench`.
+
+| Metric | Value |
+| --- | --- |
+| Throughput (drain 50k tasks) | **~10,000 jobs/sec** |
+| Enqueue→handler latency, p50 | ~1.4 ms |
+| Enqueue→handler latency, p95 | ~2.3 ms |
+| Enqueue→handler latency, p99 | ~2.5 ms |
+
+```bash
+g++ -std=c++17 -O2 bench.cpp -I. -I$(brew --prefix hiredis)/include \
+    -L$(brew --prefix hiredis)/lib -lhiredis -lpthread -o bench
+./bench            # or: ./bench <tasks> <workers>
+```
 
 ## Requirements
 - A C++17 compiler (`g++` or `clang++`).
@@ -141,9 +163,24 @@ g++ -std=c++17 example.cpp -I. \
 | `queues` | `{{"default", 1}}` | Queue name → poll weight. |
 | `concurrency` | hardware threads | Worker thread count. |
 | `leaseDuration` | 30s | How long a task may run before it's deemed lost. |
-| `pollInterval` | 500ms | Dispatch loop idle sleep. |
-| `retryBackoff` | 1s | Base delay; actual delay is `base * 2^retry`. |
+| `pollInterval` | 500ms | Dispatch loop idle sleep / housekeeping cadence. |
+| `retryBackoff` | 1s | Base delay; actual delay is jittered within `[d/2, d]`, `d = base * 2^retry`. |
+| `prefetch` | 16 | Tasks kept in flight per worker (`concurrency * prefetch`). |
+| `idempotencyTTL` | 0 (forever) | Lifetime of idempotency markers. |
 | `historyLimit` | 1000 | Completed/dead ids kept per queue. |
+
+### Idempotency (exactly-once side effects)
+At-least-once delivery means a task can run more than once (e.g. a worker crashes
+after doing the work but before recording success, so the task is redelivered).
+Attach an idempotency key and taskq guarantees the side effect happens at most
+once per key — a duplicate or redelivered task becomes a no-op that returns the
+original result:
+
+```cpp
+taskq::Task charge{TypeChargeCard, payload, 5};
+taskq::enqueue(c, charge, "payments", taskq::idempotent("order-4271"));
+// A second enqueue with key "order-4271" will not re-run the handler.
+```
 
 ## How it works
 Each queue is a set of Redis structures under `taskq:queue:<name>:*`, and every
@@ -170,7 +207,7 @@ redis-server --daemonize yes      # or: brew services start redis
 ```
 
 Tags: `[queue]`, `[schedule]`, `[retry]`, `[recovery]`, `[pause]`,
-`[threadpool]`, `[e2e]`.
+`[idempotency]`, `[threadpool]`, `[e2e]`.
 
 ## CLI
 A Python operations tool lives in [`cli/`](cli/). Inspect queues, drill into
@@ -199,8 +236,9 @@ See [`web/README.md`](web/README.md).
 ## Project layout
 ```
 .
-├── taskq.hpp          # Header-only task queue library
+├── taskq.hpp         # Header-only task queue library
 ├── example.cpp       # Producer + worker demo
+├── bench.cpp         # Throughput + latency benchmark
 ├── tests.cpp         # Catch2 regression suite
 ├── build_tests.sh    # Test build helper
 ├── format.sh         # clang-format helper

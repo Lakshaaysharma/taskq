@@ -46,6 +46,8 @@ namespace taskq {
 //   taskq:queue:<q>:dead               LIST  ids that exhausted their retries
 //   taskq:queue:<q>:paused             STR   presence means "do not dispatch"
 //   taskq:task:<id>                    HASH  the task record itself
+//   taskq:idem:<q>:<key>               STR   idempotency marker (result of a
+//                                            completed key; presence => no-op)
 // ---------------------------------------------------------------------------
 namespace keys {
 inline std::string queues() { return "taskq:queues"; }
@@ -56,6 +58,9 @@ inline std::string completed(const std::string& q) { return "taskq:queue:" + q +
 inline std::string dead(const std::string& q) { return "taskq:queue:" + q + ":dead"; }
 inline std::string paused(const std::string& q) { return "taskq:queue:" + q + ":paused"; }
 inline std::string task(const std::string& id) { return "taskq:task:" + id; }
+inline std::string idem(const std::string& q, const std::string& key) {
+  return "taskq:idem:" + q + ":" + key;
+}
 }  // namespace keys
 
 // ---------------------------------------------------------------------------
@@ -101,6 +106,11 @@ struct Task {
   int64_t createdAt = 0;  // epoch millis
   int64_t updatedAt = 0;  // epoch millis
 
+  // Optional idempotency key. When set, the handler's side effect runs at most
+  // once per (queue, key): a redelivered or duplicate task with a key that has
+  // already completed is a no-op that returns the original result.
+  std::string idempotencyKey;
+
   Task() = default;
   Task(std::string type_, std::string payload_, int maxRetries_)
       : type(std::move(type_)), payload(std::move(payload_)), maxRetries(maxRetries_) {}
@@ -118,6 +128,9 @@ struct EnqueueOptions {
   // once this time is reached. Defaults to "run immediately".
   std::chrono::system_clock::time_point runAt = std::chrono::system_clock::time_point::min();
   bool scheduled = false;
+
+  // Optional idempotency key (see Task::idempotencyKey).
+  std::string idempotencyKey;
 };
 
 inline EnqueueOptions runAt(std::chrono::system_clock::time_point when) {
@@ -129,6 +142,12 @@ inline EnqueueOptions runAt(std::chrono::system_clock::time_point when) {
 
 inline EnqueueOptions runIn(std::chrono::milliseconds delay) {
   return runAt(std::chrono::system_clock::now() + delay);
+}
+
+inline EnqueueOptions idempotent(const std::string& key) {
+  EnqueueOptions o;
+  o.idempotencyKey = key;
+  return o;
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +163,19 @@ inline int64_t nowMillis() {
 
 inline int64_t toMillis(std::chrono::system_clock::time_point tp) {
   return std::chrono::duration_cast<std::chrono::milliseconds>(tp.time_since_epoch()).count();
+}
+
+// "Equal jitter" backoff (AWS-style): returns a value uniformly in
+// [base/2, base]. Spreading retries prevents a thundering herd of failed tasks
+// all retrying at the same instant.
+inline int64_t jitter(int64_t base) {
+  if (base <= 1) return base;
+  static thread_local std::mt19937_64 rng(
+      std::random_device{}() ^
+      static_cast<uint64_t>(
+          std::chrono::high_resolution_clock::now().time_since_epoch().count()));
+  std::uniform_int_distribution<int64_t> d(0, base / 2);
+  return base / 2 + d(rng);
 }
 
 // A compact UUID v4 generator so we don't depend on libuuid. Not intended to
@@ -242,14 +274,24 @@ redis.call('HSET', 'taskq:task:' .. id, 'state', 'active', 'updatedAt', ARGV[2])
 return id
 )LUA";
 
-// Mark a leased task as completed.
+// Mark a leased task as completed. If an idempotency marker key is supplied,
+// record the result under it (atomically with completion) so future tasks
+// sharing that key become no-ops.
 // KEYS[1]=active zset  KEYS[2]=completed list
 // ARGV[1]=id  ARGV[2]=result  ARGV[3]=now(ms)  ARGV[4]=history cap
+// ARGV[5]=idempotency marker key ('' = none)  ARGV[6]=marker TTL ms (0 = persist)
 inline const char* kComplete = R"LUA(
 redis.call('ZREM', KEYS[1], ARGV[1])
 redis.call('HSET', 'taskq:task:' .. ARGV[1], 'state', 'completed', 'result', ARGV[2], 'updatedAt', ARGV[3])
 redis.call('LPUSH', KEYS[2], ARGV[1])
 redis.call('LTRIM', KEYS[2], 0, tonumber(ARGV[4]) - 1)
+if ARGV[5] ~= '' then
+  if tonumber(ARGV[6]) > 0 then
+    redis.call('SET', ARGV[5], ARGV[2], 'PX', ARGV[6])
+  else
+    redis.call('SET', ARGV[5], ARGV[2])
+  end
+end
 return 1
 )LUA";
 
@@ -391,11 +433,12 @@ inline void writeTaskHash(redisContext* c, const Task& t) {
   Reply r = command(
       c,
       "HSET %s id %s type %s payload %s result %s queue %s state %s "
-      "maxRetries %d retryCount %d lastError %s createdAt %lld updatedAt %lld",
+      "maxRetries %d retryCount %d lastError %s createdAt %lld updatedAt %lld "
+      "idempotencyKey %s",
       keys::task(t.id).c_str(), t.id.c_str(), t.type.c_str(), t.payload.c_str(),
       t.result.c_str(), t.queue.c_str(), toString(t.state).c_str(), t.maxRetries,
       t.retryCount, t.lastError.c_str(), static_cast<long long>(t.createdAt),
-      static_cast<long long>(t.updatedAt));
+      static_cast<long long>(t.updatedAt), t.idempotencyKey.c_str());
   (void)r;
 }
 }  // namespace detail
@@ -406,6 +449,7 @@ inline void enqueue(redisContext* c, Task& task, const std::string& queue,
   if (task.type.empty()) throw std::invalid_argument("taskq: task type is empty");
   if (task.id.empty()) task.id = detail::generateId();
   task.queue = queue;
+  if (!opts.idempotencyKey.empty()) task.idempotencyKey = opts.idempotencyKey;
   int64_t now = detail::nowMillis();
   task.createdAt = now;
   task.updatedAt = now;
@@ -456,7 +500,8 @@ struct ServerConfig {
   // How often the dispatch loop wakes to poll queues.
   std::chrono::milliseconds pollInterval{500};
 
-  // Base delay for the exponential retry backoff (delay = base * 2^retry).
+  // Base delay for the exponential retry backoff. The actual delay is
+  // jittered within [d/2, d] where d = base * 2^retry.
   std::chrono::milliseconds retryBackoff{1000};
 
   // Worker thread count. 0 => hardware_concurrency.
@@ -464,6 +509,16 @@ struct ServerConfig {
 
   // How many completed / dead task ids to retain per queue for inspection.
   int historyLimit = 1000;
+
+  // Time-to-live for idempotency markers. 0 => keep forever. A finite TTL
+  // bounds the dedup window (a key can run again once its marker expires).
+  std::chrono::milliseconds idempotencyTTL{0};
+
+  // How many tasks to keep in flight per worker. The dispatcher leases up to
+  // (concurrency * prefetch) tasks before waiting, so workers are never
+  // starved between polls. Higher values raise throughput at the cost of more
+  // simultaneously-leased tasks.
+  int prefetch = 16;
 };
 
 // ---------------------------------------------------------------------------
@@ -498,31 +553,50 @@ class Server {
       for (int i = 0; i < std::max(1, weight); ++i) order.push_back(name);
     }
 
+    const size_t window = std::max<size_t>(1, config_.concurrency * std::max(1, config_.prefetch));
+    int64_t lastHousekeep = 0;
+
     while (running_) {
       int64_t now = detail::nowMillis();
-      bool didWork = false;
 
-      for (const auto& q : config_.queues) {
-        // 1. Promote scheduled tasks whose time has come.
-        promoteScheduled(ctx, q.first, now);
-        // 2. Recover tasks abandoned by dead workers.
-        recoverStuck(ctx, q.first, now);
-      }
-
-      // 3. Dispatch pending tasks, respecting weighting and pool capacity.
-      for (const auto& q : order) {
-        if (pool.outstanding() >= config_.concurrency) break;
-        std::string id = dequeue(ctx, q, now);
-        if (!id.empty()) {
-          didWork = true;
-          pool.submit([this, id, q] { process(id, q); });
+      // Housekeeping (promote scheduled + recover expired leases) is throttled
+      // to once per poll interval instead of running on every dispatch, so it
+      // doesn't add two EVALs of overhead to every task under load.
+      if (now - lastHousekeep >= config_.pollInterval.count()) {
+        for (const auto& q : config_.queues) {
+          promoteScheduled(ctx, q.first, now);
+          recoverStuck(ctx, q.first, now);
         }
+        lastHousekeep = now;
       }
 
-      if (!didWork) {
-        std::unique_lock<std::mutex> lock(wakeMutex_);
-        wakeCv_.wait_for(lock, config_.pollInterval, [this] { return !running_; });
+      // Drain: lease tasks (honoring queue weights) until the in-flight window
+      // is full or every queue is empty. Batching many dequeues per wake-up,
+      // rather than one, is what lets throughput approach the dispatch ceiling.
+      bool full = false;
+      bool moreWork = true;
+      while (moreWork && running_) {
+        moreWork = false;
+        for (const auto& q : order) {
+          if (inFlight_.load() >= window) {
+            full = true;
+            break;
+          }
+          std::string id = dequeue(ctx, q, detail::nowMillis());
+          if (!id.empty()) {
+            moreWork = true;
+            inFlight_.fetch_add(1);
+            pool.submit([this, id, q] { process(id, q); });
+          }
+        }
+        if (full) break;
       }
+
+      // Sleep until a worker frees a slot (short wait) or, if idle, until the
+      // next poll. Completions notify wakeCv_, so we wake promptly under load.
+      std::unique_lock<std::mutex> lock(wakeMutex_);
+      wakeCv_.wait_for(lock, full ? std::chrono::milliseconds(2) : config_.pollInterval,
+                       [this] { return !running_; });
     }
 
     pool.shutdown();
@@ -568,35 +642,87 @@ class Server {
     return {};
   }
 
+  // Each worker thread keeps one long-lived Redis connection, reused across
+  // every task it handles. Opening a fresh connection per task exhausts the
+  // OS's ephemeral ports under load, so the connection is cached in
+  // thread-local storage and only reopened after an error.
+  redisContext* workerConn() {
+    struct Holder {
+      redisContext* c = nullptr;
+      ~Holder() {
+        if (c) redisFree(c);
+      }
+    };
+    thread_local Holder holder;
+    if (holder.c && holder.c->err == 0) return holder.c;
+    if (holder.c) {
+      redisFree(holder.c);
+      holder.c = nullptr;
+    }
+    redisContext* c = redisConnect(config_.host.c_str(), config_.port);
+    if (c == nullptr || c->err) {
+      if (c) redisFree(c);
+      return nullptr;
+    }
+    holder.c = c;
+    return c;
+  }
+
   // Executed on a pool thread: load the task, run its handler, record outcome.
   void process(const std::string& id, const std::string& queue) {
-    redisContext* c = nullptr;
+    // Whatever happens, mark the slot free and wake the dispatcher so it can
+    // lease the next task immediately.
+    struct SlotGuard {
+      Server* s;
+      ~SlotGuard() {
+        s->inFlight_.fetch_sub(1);
+        s->wakeCv_.notify_one();
+      }
+    } slotGuard{this};
+
+    redisContext* c = workerConn();
+    if (c == nullptr) {
+      std::cerr << "taskq worker: cannot connect to Redis" << std::endl;
+      return;  // task keeps its lease and is recovered later
+    }
+
     try {
-      c = connect();
+      Task task = loadTask(c, id);
+      task.queue = queue;
+      auto it = detail::registry().find(task.type);
+
+      if (it == detail::registry().end()) {
+        fail(c, task, "no handler registered for type '" + task.type + "'");
+        return;
+      }
+
+      // Idempotency: if this key's side effect already ran (marker present),
+      // skip the handler and return the original result. This makes a
+      // redelivered or duplicate task a no-op.
+      bool skip = false;
+      if (!task.idempotencyKey.empty()) {
+        detail::Reply m =
+            detail::command(c, "GET %s", keys::idem(queue, task.idempotencyKey).c_str());
+        if (m->type == REDIS_REPLY_STRING) {
+          task.result.assign(m->str, m->len);
+          skip = true;
+        }
+      }
+
+      try {
+        if (!skip) it->second(task);
+        complete(c, task);
+      } catch (const std::exception& e) {
+        fail(c, task, e.what());
+      } catch (...) {
+        fail(c, task, "unknown exception");
+      }
     } catch (const std::exception& e) {
+      // A Redis-level error (thrown by detail::command). The connection is now
+      // flagged and workerConn() will reopen it next time; this task keeps its
+      // lease and will be recovered.
       std::cerr << "taskq worker: " << e.what() << std::endl;
-      return;
     }
-
-    Task task = loadTask(c, id);
-    task.queue = queue;
-    auto it = detail::registry().find(task.type);
-
-    if (it == detail::registry().end()) {
-      fail(c, task, "no handler registered for type '" + task.type + "'");
-      redisFree(c);
-      return;
-    }
-
-    try {
-      it->second(task);
-      complete(c, task);
-    } catch (const std::exception& e) {
-      fail(c, task, e.what());
-    } catch (...) {
-      fail(c, task, "unknown exception");
-    }
-    redisFree(c);
   }
 
   Task loadTask(redisContext* c, const std::string& id) {
@@ -617,22 +743,26 @@ class Server {
       else if (field == "lastError") t.lastError = value;
       else if (field == "createdAt") t.createdAt = std::stoll(value);
       else if (field == "updatedAt") t.updatedAt = std::stoll(value);
+      else if (field == "idempotencyKey") t.idempotencyKey = value;
     }
     return t;
   }
 
   void complete(redisContext* c, const Task& t) {
-    detail::command(c, "EVAL %s 2 %s %s %s %s %lld %d", lua::kComplete,
+    std::string marker =
+        t.idempotencyKey.empty() ? "" : keys::idem(t.queue, t.idempotencyKey);
+    detail::command(c, "EVAL %s 2 %s %s %s %s %lld %d %s %lld", lua::kComplete,
                     keys::active(t.queue).c_str(), keys::completed(t.queue).c_str(),
                     t.id.c_str(), t.result.c_str(),
-                    static_cast<long long>(detail::nowMillis()), config_.historyLimit);
+                    static_cast<long long>(detail::nowMillis()), config_.historyLimit,
+                    marker.c_str(), static_cast<long long>(config_.idempotencyTTL.count()));
   }
 
   void fail(redisContext* c, const Task& t, const std::string& error) {
     int64_t now = detail::nowMillis();
-    // Exponential backoff based on retries already used.
+    // Exponential backoff with equal jitter, based on retries already used.
     int64_t backoff = config_.retryBackoff.count() * (1LL << std::min(t.retryCount, 20));
-    int64_t retryAt = now + backoff;
+    int64_t retryAt = now + detail::jitter(backoff);
     detail::command(c, "EVAL %s 4 %s %s %s %s %s %s %lld %lld %d", lua::kFail,
                     keys::active(t.queue).c_str(), keys::pending(t.queue).c_str(),
                     keys::scheduled(t.queue).c_str(), keys::dead(t.queue).c_str(),
@@ -642,6 +772,7 @@ class Server {
 
   ServerConfig config_;
   std::atomic<bool> running_{false};
+  std::atomic<size_t> inFlight_{0};  // leased tasks not yet finished
   std::mutex wakeMutex_;
   std::condition_variable wakeCv_;
 };

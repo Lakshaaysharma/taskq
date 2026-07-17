@@ -303,3 +303,76 @@ TEST_CASE("paused queue is not dispatched", "[pause][e2e]") {
   REQUIRE(ran.load() == true);
   redisFree(c);
 }
+
+TEST_CASE("idempotency key makes duplicate/redelivered tasks no-ops", "[idempotency][e2e]") {
+  redisContext* c = redisConnect("127.0.0.1", 6379);
+  redisReply* fr = static_cast<redisReply*>(redisCommand(c, "FLUSHDB"));
+  freeReplyObject(fr);
+
+  std::atomic<int> runs{0};
+  taskq::registerHandler("e2e:idem", [&runs](taskq::Task& task) {
+    runs.fetch_add(1);
+    task.result = "{\"charged\":true}";
+  });
+
+  BackgroundServer bg(fastConfig({{"default", 1}}));
+
+  // First task with idempotency key "order-42": the handler runs.
+  taskq::Task a{"e2e:idem", "{}", 0};
+  taskq::enqueue(c, a, "default", taskq::idempotent("order-42"));
+  for (int i = 0; i < 200; ++i) {
+    if (hget(c, taskq::keys::task(a.id), "state") == "completed") break;
+    std::this_thread::sleep_for(20ms);
+  }
+  REQUIRE(hget(c, taskq::keys::task(a.id), "state") == "completed");
+  REQUIRE(runs.load() == 1);
+
+  // A duplicate/redelivered task with the SAME key must be a no-op that still
+  // returns the original result.
+  taskq::Task b{"e2e:idem", "{}", 0};
+  taskq::enqueue(c, b, "default", taskq::idempotent("order-42"));
+  for (int i = 0; i < 200; ++i) {
+    if (hget(c, taskq::keys::task(b.id), "state") == "completed") break;
+    std::this_thread::sleep_for(20ms);
+  }
+  REQUIRE(hget(c, taskq::keys::task(b.id), "state") == "completed");
+  REQUIRE(runs.load() == 1);  // handler did NOT run a second time
+  REQUIRE(hget(c, taskq::keys::task(b.id), "result") == "{\"charged\":true}");
+  redisFree(c);
+}
+
+TEST_CASE("task abandoned by a crashed worker is reclaimed and completed", "[recovery][e2e]") {
+  redisContext* c = redisConnect("127.0.0.1", 6379);
+  redisReply* fr = static_cast<redisReply*>(redisCommand(c, "FLUSHDB"));
+  freeReplyObject(fr);
+
+  std::atomic<int> runs{0};
+  taskq::registerHandler("e2e:reclaim", [&runs](taskq::Task& task) {
+    runs.fetch_add(1);
+    task.result = "done";
+  });
+
+  taskq::Task t{"e2e:reclaim", "{}", 0};
+  taskq::enqueue(c, t, "default");
+
+  // Simulate a worker that leased the task and died before finishing: move it
+  // out of pending and into the active set with a lease that already expired.
+  redisReply* r =
+      static_cast<redisReply*>(redisCommand(c, "RPOP %s", taskq::keys::pending("default").c_str()));
+  freeReplyObject(r);
+  int64_t expired = taskq::detail::nowMillis() - 5000;
+  r = static_cast<redisReply*>(redisCommand(c, "ZADD %s %lld %s",
+                                            taskq::keys::active("default").c_str(),
+                                            static_cast<long long>(expired), t.id.c_str()));
+  freeReplyObject(r);
+
+  // The server's recovery loop should requeue it, after which it runs to completion.
+  BackgroundServer bg(fastConfig({{"default", 1}}));
+  for (int i = 0; i < 200; ++i) {
+    if (hget(c, taskq::keys::task(t.id), "state") == "completed") break;
+    std::this_thread::sleep_for(20ms);
+  }
+  REQUIRE(hget(c, taskq::keys::task(t.id), "state") == "completed");
+  REQUIRE(runs.load() == 1);
+  redisFree(c);
+}
